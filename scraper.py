@@ -49,12 +49,14 @@ BOARDS = [
         "state_file": "seen_sce.json",
         "index_url": "https://sce.skku.edu/sce/index.do",
         "view_base": "https://sce.skku.edu/sce/notice.do",
-        # 표시 스타일: 미니멀 · 단일 테마색. 로고/이모지 없이 깔끔하게.
+        # 표시 스타일: 미니멀 · 단일 테마색.
+        # 상단  "💽 SCE Notice [카테고리]" · 제목 · 본문 · 하단 "SCE Notice · 날짜 · (상대시각)"
         "style": "simple",
         "logo": None,
         "accent_color": 0x0EA5A6,   # 테크 틸(teal) — 대학 카드와 확실히 구분
-        "symbol": "",
-        "new_prefix": "**[반도체융합공학과] 새 공지**",
+        "symbol": "💽",
+        "card_label": "SCE Notice",
+        "new_prefix": "",           # 머리말 없이 임베드로 바로
     },
 ]
 
@@ -375,13 +377,17 @@ def build_embed_simple(board, article):
     """
     symbol = board.get("symbol", "")
     color = board.get("accent_color", DEFAULT_COLOR)
+    label = board.get("card_label", board["name"])
     cat = _cat_key(article.get("category", ""))
 
-    author_name = f"{symbol} {board['name']}".strip()
-    title = _title(article)
+    # 상단(author) 라인: "💽 SCE Notice [카테고리]"
+    head = f"{label} [{cat}]" if cat else label
+    if symbol:
+        head = f"{symbol} {head}"
+
     embed = {
-        "author": {"name": author_name},
-        "title": f"「{cat}」 {title}" if cat else title,
+        "author": {"name": head},
+        "title": _title(article),   # 제목만 (카테고리는 상단 라인으로)
         "url": article["url"],
         "color": color,
     }
@@ -397,8 +403,9 @@ def build_embed_simple(board, article):
     if parts:
         embed["description"] = "\n\n".join(parts)
 
+    # 하단(footer): "SCE Notice · 날짜" + Discord 가 timestamp 를 "어제 오전"처럼 덧붙임
     date = article.get("date", "")
-    embed["footer"] = {"text": f"SCE Notice · {date}" if date else "SCE Notice"}
+    embed["footer"] = {"text": f"{label} · {date}" if date else label}
     ts = _iso(date)
     if ts:
         embed["timestamp"] = ts
@@ -414,7 +421,9 @@ def build_embed(board, article):
 def send_discord(webhook, board, article, prefix=None):
     if prefix is None:
         prefix = board.get("new_prefix", "📢 **새 공지가 올라왔어요!**")
-    payload = {"content": prefix, "embeds": [build_embed(board, article)]}
+    payload = {"embeds": [build_embed(board, article)]}
+    if prefix:  # 머리말이 있으면 임베드 위 본문으로, 없으면 임베드만
+        payload["content"] = prefix
     r = requests.post(webhook, json=payload, timeout=20)
     r.raise_for_status()
 
