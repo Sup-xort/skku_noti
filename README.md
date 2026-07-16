@@ -11,7 +11,13 @@
 1. `scraper.py` 가 목록 페이지(`notice01.do?mode=list`)를 파싱해 게시글의
    `articleNo`·제목·카테고리·작성자·날짜를 추출합니다. (서버 사이드 렌더링이라 JS 실행 불필요)
 2. `seen_articles.json` 에 저장된 "이전에 본 글 번호"와 비교해 **새 글만** 골라냅니다.
-3. 새 글을 Discord Webhook 으로 전송하고, 상태 파일을 갱신해 다시 커밋합니다.
+3. 새 글의 상세페이지에서 **본문 미리보기·첨부파일 목록**을 가져와,
+   카테고리별 색상/이모지로 꾸민 Discord 임베드로 전송하고 상태 파일을 갱신해 다시 커밋합니다.
+
+### 알림 카드에 담기는 정보
+- 카테고리(색상·이모지로 구분) / 제목(클릭 시 원문 이동)
+- 본문 앞부분 미리보기(기본 180자)
+- 작성자 · 작성일 · 첨부파일 이름 목록
 
 > 최초 실행 시에는 도배를 막기 위해 현재 목록을 전부 "기준선"으로만 저장하고 알림은 보내지 않습니다.
 > 그 이후 올라오는 글부터 알림이 갑니다.
@@ -49,6 +55,16 @@ export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
 export FORCE_LATEST=1   # 최신 글 1건 테스트 전송(선택)
 python scraper.py
 ```
+
+## 디자인/표시 커스터마이즈
+`scraper.py` 상단 상수로 조절합니다.
+- `CATEGORY_COLORS` / `CATEGORY_EMOJI` — 카테고리별 임베드 색상·이모지
+- `PREVIEW_LEN` — 본문 미리보기 글자 수(기본 180)
+- `LOGO_URL` — 카드에 표시되는 로고 아이콘
+
+> 지금은 본문을 **그대로 발췌**해 미리보기로 보여줍니다. 진짜 AI 요약이 필요하면
+> `fetch_detail` 에서 얻은 본문을 LLM API(Claude/OpenAI 등)로 요약하도록 확장할 수 있습니다.
+> (별도 API 키·호출 비용 필요)
 
 ## 크론 주기 변경
 `.github/workflows/notice.yml` 의 `cron` 값을 수정하세요. (UTC 기준)
