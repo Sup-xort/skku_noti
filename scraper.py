@@ -36,7 +36,10 @@ BOARDS = [
         "webhook_env": "DISCORD_WEBHOOK_URL",
         "state_file": "seen_articles.json",
         "base_url": "https://www.skku.edu/skku/campus/skk_comm/notice01.do",
+        # 표시 스타일: 카테고리별 색상/이모지 + 로고 아이콘 + 상세 필드
+        "style": "full",
         "logo": "https://www.skku.edu/_res/skku/img/skku_s.png",
+        "new_prefix": "📢 **새 공지가 올라왔어요!**",
     },
     {
         "key": "sce",
@@ -46,7 +49,13 @@ BOARDS = [
         "state_file": "seen_sce.json",
         "index_url": "https://sce.skku.edu/sce/index.do",
         "view_base": "https://sce.skku.edu/sce/notice.do",
-        "logo": "https://www.skku.edu/_res/skku/img/skku_s.png",
+        # 표시 스타일: 미니멀 · 단일 테마색 · 칩(반도체) 이모지. 로고 이미지 없음.
+        # 학과 공식 심볼 이미지가 생기면 아래 logo 에 URL 을 넣으면 됨(현재 미사용).
+        "style": "simple",
+        "logo": None,
+        "accent_color": 0x0EA5A6,   # 테크 틸(teal) — 대학 카드와 확실히 구분
+        "symbol": "🔬",
+        "new_prefix": "🔬 **[반도체융합공학과] 새 공지**",
     },
 ]
 
@@ -317,25 +326,29 @@ def save_seen(state_file, seen):
 
 
 # ─────────────────── Discord 전송 ───────────────────
-def build_embed(board, article):
+def _title(article):
+    t = article["title"]
+    return t[:237] + "..." if len(t) > 240 else t
+
+
+def _iso(date):
+    return f"{date}T00:00:00.000Z" if len(date) == 10 and date[4] == "-" else None
+
+
+def build_embed_full(board, article):
+    """대학 공지용: 카테고리별 색상/이모지 + 로고 + 상세 필드(작성/작성일/첨부)."""
     cat = _cat_key(article.get("category", ""))
-    color = CATEGORY_COLORS.get(cat, DEFAULT_COLOR)
-    emoji = CATEGORY_EMOJI.get(cat, "🔔")
     logo = board.get("logo")
 
-    title = article["title"]
-    if len(title) > 240:
-        title = title[:237] + "..."
-
     embed = {
-        "author": {"name": f"{emoji} {article.get('category') or '공지'}", "icon_url": logo},
-        "title": title,
+        "author": {"name": f"{CATEGORY_EMOJI.get(cat, '🔔')} {article.get('category') or '공지'}",
+                   "icon_url": logo},
+        "title": _title(article),
         "url": article["url"],
-        "color": color,
+        "color": CATEGORY_COLORS.get(cat, DEFAULT_COLOR),
         "fields": [],
         "footer": {"text": board["name"], "icon_url": logo},
     }
-
     if article.get("preview"):
         embed["description"] = article["preview"]
     if article.get("writer"):
@@ -345,20 +358,60 @@ def build_embed(board, article):
 
     atts = article.get("attachments") or []
     if atts:
-        shown = atts[:5]
-        value = "\n".join(f"• {name}" for name in shown)
+        value = "\n".join(f"• {name}" for name in atts[:5])
         if len(atts) > 5:
             value += f"\n… 외 {len(atts) - 5}개"
         embed["fields"].append({"name": f"📎 첨부파일 ({len(atts)})", "value": value, "inline": False})
 
-    date = article.get("date", "")
-    if len(date) == 10 and date[4] == "-":
-        embed["timestamp"] = f"{date}T00:00:00.000Z"
-
+    ts = _iso(article.get("date", ""))
+    if ts:
+        embed["timestamp"] = ts
     return embed
 
 
-def send_discord(webhook, board, article, prefix="📢 **새 공지가 올라왔어요!**"):
+def build_embed_simple(board, article):
+    """학과 공지용: 미니멀 · 단일 테마색 · 칩 이모지. 별도 필드 없이 한눈에.
+
+    카테고리는 제목 앞 배지로, 날짜/첨부는 하단에 간결하게 녹인다.
+    """
+    symbol = board.get("symbol", "🔔")
+    color = board.get("accent_color", DEFAULT_COLOR)
+    cat = _cat_key(article.get("category", ""))
+
+    title = _title(article)
+    embed = {
+        "author": {"name": f"{symbol} {board['name']}"},
+        "title": f"「{cat}」 {title}" if cat else title,
+        "url": article["url"],
+        "color": color,
+    }
+
+    parts = []
+    if article.get("preview"):
+        parts.append(article["preview"])
+    atts = article.get("attachments") or []
+    if atts:
+        parts.append("📎 " + ", ".join(atts[:5]) + (f" 외 {len(atts) - 5}개" if len(atts) > 5 else ""))
+    if parts:
+        embed["description"] = "\n\n".join(parts)
+
+    date = article.get("date", "")
+    embed["footer"] = {"text": f"SCE Notice · {date}" if date else "SCE Notice"}
+    ts = _iso(date)
+    if ts:
+        embed["timestamp"] = ts
+    return embed
+
+
+def build_embed(board, article):
+    if board.get("style") == "simple":
+        return build_embed_simple(board, article)
+    return build_embed_full(board, article)
+
+
+def send_discord(webhook, board, article, prefix=None):
+    if prefix is None:
+        prefix = board.get("new_prefix", "📢 **새 공지가 올라왔어요!**")
     payload = {"content": prefix, "embeds": [build_embed(board, article)]}
     r = requests.post(webhook, json=payload, timeout=20)
     r.raise_for_status()

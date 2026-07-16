@@ -79,8 +79,20 @@ python scraper.py
 - 새 `webhook_env`·`state_file` 을 부여하고, 워크플로우 `env` 에 시크릿을 추가
 
 ## 디자인/표시 커스터마이즈
-`scraper.py` 상단 상수로 조절합니다.
-- `CATEGORY_COLORS` / `CATEGORY_EMOJI` — 카테고리별 임베드 색상·이모지
+
+### 게시판별 메시지 스타일
+각 게시판은 `BOARDS` 항목의 `style` 값으로 카드 모양을 고릅니다.
+- `"full"` (대학 공지) — 카테고리별 색상/이모지 + 로고 아이콘 + 작성/작성일/첨부 필드
+- `"simple"` (학과 공지) — 미니멀 카드: 단일 테마색(`accent_color`) + 칩 이모지(`symbol`),
+  카테고리는 제목 앞 배지(`「채용/모집」`), 날짜는 하단에 간결하게. 로고 이미지 없음.
+
+관련 설정: `accent_color`(고정 색상), `symbol`(앞 이모지), `new_prefix`(알림 머리말), `logo`(아이콘 URL).
+
+> 학과 공식 심볼 이미지가 생기면, 그 PNG를 레포에 넣고(`assets/` 등) `raw.githubusercontent.com`
+> URL 을 sce 보드의 `logo` 에 넣으면 카드에 로고가 표시됩니다. (레포가 public 이어야 Discord 가 이미지를 가져옵니다.)
+
+### 공통
+- `CATEGORY_COLORS` / `CATEGORY_EMOJI` — `full` 스타일의 카테고리별 색상·이모지
 - `PREVIEW_LEN` — 본문 미리보기 글자 수(기본 180)
 
 > 지금은 본문을 **그대로 발췌**해 미리보기로 보여줍니다. 진짜 AI 요약이 필요하면
