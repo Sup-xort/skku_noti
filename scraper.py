@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""SKKU 공지사항 게시판을 크롤링해 새 글을 Discord로 알림.
+"""SKKU 공지 게시판들을 크롤링해 새 글을 Discord로 알림.
 
-- 목록 페이지(notice01.do?mode=list)를 파싱해 게시글을 추출한다.
-- seen_articles.json 에 저장된 이전에 본 articleNo 와 비교해 새 글만 골라낸다.
-- 각 새 글의 상세페이지에서 본문 미리보기/첨부파일을 가져와
-  보기 좋은 Discord 임베드로 전송하고 상태 파일을 갱신한다.
+여러 게시판을 BOARDS 설정으로 관리한다. 각 게시판은 자기만의
+Discord Webhook(환경변수)과 상태파일(seen_*.json)을 가진다.
+
+- skku_list : 대학 공지(notice01.do). 목록 페이지네이션 + 상세페이지에서 본문/첨부 수집.
+- sce_lobby : 학과 공지(반도체융합공학과). 상세페이지는 로그인 벽이라,
+              메인(index.do) 로비에 노출되는 최신 공지 4건을 파싱(본문 전문이 로비에 포함됨).
 
 환경변수:
-  DISCORD_WEBHOOK_URL  (필수) Discord Incoming Webhook URL
-  FORCE_LATEST         "1" 이면 새 글이 없어도 가장 최근 글 1건을 전송(동작 확인용)
+  DISCORD_WEBHOOK_URL       대학 공지용 Webhook (skku 보드)
+  SCE_DISCORD_WEBHOOK_URL   학과 공지용 Webhook (sce 보드)
+  FORCE_LATEST              "1" 이면 새 글이 없어도 각 보드의 최신 글 1건을 전송(동작 확인용)
+
+Webhook 이 설정되지 않은 보드는 조용히 건너뛴다.
 """
 
 import html as html_lib
@@ -20,18 +25,35 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-BASE_URL = "https://www.skku.edu/skku/campus/skk_comm/notice01.do"
-STATE_FILE = Path(__file__).parent / "seen_articles.json"
+HERE = Path(__file__).parent
 
-# 한 페이지 게시글 수, 그리고 새 글을 찾아 거슬러 올라갈 최대 페이지 수(안전 상한).
-# 새 글이 한 페이지에 하나도 없으면 그 지점에서 멈추므로, 보통은 1~2페이지만 읽는다.
-PAGE_SIZE = 10
-MAX_PAGES = 10
+# ─────────────────────────── 게시판 설정 ───────────────────────────
+BOARDS = [
+    {
+        "key": "skku",
+        "name": "성균관대학교 공지사항",
+        "type": "skku_list",
+        "webhook_env": "DISCORD_WEBHOOK_URL",
+        "state_file": "seen_articles.json",
+        "base_url": "https://www.skku.edu/skku/campus/skk_comm/notice01.do",
+        "logo": "https://www.skku.edu/_res/skku/img/skku_s.png",
+    },
+    {
+        "key": "sce",
+        "name": "반도체융합공학과 공지",
+        "type": "sce_lobby",
+        "webhook_env": "SCE_DISCORD_WEBHOOK_URL",
+        "state_file": "seen_sce.json",
+        "index_url": "https://sce.skku.edu/sce/index.do",
+        "view_base": "https://sce.skku.edu/sce/notice.do",
+        "logo": "https://www.skku.edu/_res/skku/img/skku_s.png",
+    },
+]
 
-LOGO_URL = "https://www.skku.edu/_res/skku/img/skku_s.png"
-
-# 본문 미리보기 최대 길이(글자)
-PREVIEW_LEN = 180
+# ─────────────────────────── 공통 설정 ───────────────────────────
+PAGE_SIZE = 10   # skku_list: 한 페이지 게시글 수
+MAX_PAGES = 10   # skku_list: 새 글을 찾아 거슬러 올라갈 최대 페이지(안전 상한)
+PREVIEW_LEN = 180  # 본문 미리보기 최대 길이(글자)
 
 HEADERS = {
     "User-Agent": (
@@ -40,7 +62,6 @@ HEADERS = {
     )
 }
 
-# 카테고리별 임베드 색상 (없는 카테고리는 DEFAULT_COLOR)
 CATEGORY_COLORS = {
     "학사": 0x1B6CA8,       # 파랑
     "장학": 0x2E9E5B,       # 초록
@@ -54,7 +75,6 @@ CATEGORY_COLORS = {
 }
 DEFAULT_COLOR = 0x0B5FA5
 
-# 카테고리별 앞머리 이모지
 CATEGORY_EMOJI = {
     "학사": "🎓",
     "장학": "💰",
@@ -77,12 +97,18 @@ def _cat_key(category):
     return category.strip().strip("[]").strip()
 
 
-def fetch_page(offset=0):
-    """목록의 한 페이지를 파싱해 게시글 리스트를 반환.
+def _truncate(text, limit=PREVIEW_LEN):
+    text = _clean(text)
+    if len(text) > limit:
+        return text[:limit].rstrip() + " …"
+    return text
 
-    반환: [{no, title, url, category, writer, date, pinned}], 최신(articleNo 큰 것)이 앞.
-    """
-    list_url = f"{BASE_URL}?mode=list&articleLimit={PAGE_SIZE}&article.offset={offset}"
+
+# ─────────────────── skku_list (대학 공지) 파서 ───────────────────
+def skku_fetch_page(board, offset=0):
+    """대학 공지 목록의 한 페이지를 파싱해 게시글 리스트(최신 먼저)를 반환."""
+    base = board["base_url"]
+    list_url = f"{base}?mode=list&articleLimit={PAGE_SIZE}&article.offset={offset}"
     resp = requests.get(list_url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     resp.encoding = resp.apparent_encoding or "utf-8"
@@ -112,12 +138,11 @@ def fetch_page(offset=0):
         writer = info[1].get_text(strip=True) if len(info) > 1 else ""
         date = info[2].get_text(strip=True) if len(info) > 2 else ""
 
-        full_url = f"{BASE_URL}?mode=view&articleNo={no}&article.offset=0&articleLimit=10"
         articles.append(
             {
                 "no": int(no),
                 "title": html_lib.unescape(title),
-                "url": full_url,
+                "url": f"{base}?mode=view&articleNo={no}&article.offset=0&articleLimit=10",
                 "category": category,
                 "writer": writer,
                 "date": date,
@@ -129,119 +154,196 @@ def fetch_page(offset=0):
     return articles
 
 
-def fetch_articles():
-    """목록 첫 페이지만 반환(최초 실행 기준선/동작확인용)."""
-    return fetch_page(0)
-
-
-def collect_new_articles(seen):
-    """이미 본 글이 나올 때까지 페이지를 넘겨가며 '새 글'을 모두 수집한다.
-
-    새 글이 한 페이지에 하나도 없으면 멈춘다(그 이후는 전부 본 글).
-    고정공지(pinned)가 여러 페이지에 반복돼도 articleNo 로 중복 제거된다.
-    반환: 새 글 리스트(articleNo 오름차순 = 오래된 것 먼저).
-    """
+def skku_collect_new(board, seen):
+    """이미 본 글이 나올 때까지 페이지를 넘겨가며 새 글을 모두 수집(오래된 것 먼저)."""
     new_by_no = {}
     for page in range(MAX_PAGES):
-        articles = fetch_page(page * PAGE_SIZE)
+        articles = skku_fetch_page(board, page * PAGE_SIZE)
         if not articles:
             break
         page_new = [a for a in articles if a["no"] not in seen and a["no"] not in new_by_no]
         for a in page_new:
             new_by_no[a["no"]] = a
-        # 이 페이지에서 새 글이 하나도 없으면 더 볼 필요 없음
         if not page_new:
             break
     else:
-        print(f"경고: 최대 {MAX_PAGES}페이지까지 읽었지만 계속 새 글이 있었습니다. "
+        print(f"경고[{board['key']}]: 최대 {MAX_PAGES}페이지를 읽었지만 계속 새 글이 있었습니다. "
               "일부 오래된 글을 놓쳤을 수 있습니다.", file=sys.stderr)
 
     return sorted(new_by_no.values(), key=lambda a: a["no"])
 
 
-def fetch_detail(no):
-    """상세페이지에서 본문 미리보기와 첨부파일 목록을 가져온다.
-
-    실패해도 알림은 계속 가야 하므로 예외를 삼키고 빈 값을 반환한다.
-    반환: {"preview": str, "attachments": [str, ...]}
-    """
-    url = f"{BASE_URL}?mode=view&articleNo={no}&article.offset=0&articleLimit=10"
+def skku_enrich(board, article):
+    """상세페이지에서 본문 미리보기/첨부파일을 채운다(실패해도 무해)."""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp = requests.get(article["url"], headers=HEADERS, timeout=20)
         resp.raise_for_status()
         resp.encoding = resp.apparent_encoding or "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # 본문: '게시글 내용' 라벨(dt) 다음의 dd
-        preview = ""
         label = soup.find("dt", string=lambda s: s and "게시글 내용" in s)
         body_el = label.find_next("dd") if label else None
         if body_el:
-            text = body_el.get_text("\n", strip=True)
-            text = "\n".join(line for line in text.splitlines() if line.strip())
-            if len(text) > PREVIEW_LEN:
-                preview = text[:PREVIEW_LEN].rstrip() + " …"
-            else:
-                preview = text
+            text = "\n".join(l for l in body_el.get_text("\n", strip=True).splitlines() if l.strip())
+            article["preview"] = _truncate(text)
 
-        # 첨부파일 이름
         attachments = []
         for a in soup.select("a[href*='mode=download']"):
             name = _clean(a.get_text(strip=True))
             if name and name not in attachments:
                 attachments.append(name)
+        article["attachments"] = attachments
+    except Exception as e:  # noqa: BLE001
+        print(f"  (상세 조회 실패 {board['key']} no={article['no']}: {e})", file=sys.stderr)
+    return article
 
-        return {"preview": preview, "attachments": attachments}
-    except Exception as e:  # noqa: BLE001 - 상세 실패는 치명적이지 않음
-        print(f"  (상세 조회 실패 no={no}: {e})", file=sys.stderr)
-        return {"preview": "", "attachments": []}
+
+# ─────────────────── sce_lobby (학과 공지) 파서 ───────────────────
+def sce_fetch_articles(board):
+    """학과 메인 로비의 최신 공지(보통 4건)를 파싱. 본문 전문이 로비에 포함돼 있어
+    별도 상세 조회 없이 미리보기까지 채운다. (상세페이지는 로그인 벽)"""
+    resp = requests.get(board["index_url"], headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    resp.encoding = resp.apparent_encoding or "utf-8"
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    origin = board["index_url"].split("/", 3)
+    origin = f"{origin[0]}//{origin[2]}"  # https://sce.skku.edu
+
+    articles = []
+    ul = soup.select_one("ul.mini-type01")
+    if not ul:
+        return articles
+
+    for li in ul.find_all("li", recursive=False):
+        link = li.select_one(".mini-board-content-title a[href*='articleNo=']")
+        if not link:
+            continue
+        href = link.get("href", "").replace("&amp;", "&")
+        no = None
+        for part in href.split("?", 1)[-1].split("&"):
+            if part.startswith("articleNo="):
+                no = part.split("=", 1)[1]
+                break
+        if not no:
+            continue
+
+        title = _clean(link.get_text(strip=True))
+        cat_el = li.select_one(".mini-board-category")
+        category = cat_el.get_text(strip=True) if cat_el else ""
+        date_el = li.select_one(".mini-board-date")
+        date = date_el.get_text(strip=True) if date_el else ""
+
+        inner = li.select_one(".mini-board-content-inner")
+        body = _clean(inner.get_text(" ", strip=True)) if inner else ""
+        if body.startswith(title):  # 로비 본문 앞에 제목이 중복돼 있으면 제거
+            body = body[len(title):].strip()
+
+        # 로비에 첨부파일이 노출되는 경우가 있으면 수집(현재는 대개 없음)
+        attachments = []
+        for a in li.select("a[href*='download'], a[href*='fileDown'], a[href*='attach']"):
+            name = _clean(a.get_text(strip=True))
+            if name and name not in attachments:
+                attachments.append(name)
+
+        url = href if href.startswith("http") else origin + href
+        articles.append(
+            {
+                "no": int(no),
+                "title": html_lib.unescape(title),
+                "url": url,
+                "category": category,
+                "writer": "",
+                "date": date,
+                "pinned": False,
+                "preview": _truncate(body),
+                "attachments": attachments,
+            }
+        )
+
+    articles.sort(key=lambda a: a["no"], reverse=True)
+    return articles
 
 
-def load_seen():
-    if STATE_FILE.exists():
+# ─────────────────── 보드 타입 디스패치 ───────────────────
+def board_current(board):
+    """현재 노출된 게시글 전체(최신 먼저). 최초 실행 기준선/동작확인용."""
+    if board["type"] == "skku_list":
+        return skku_fetch_page(board, 0)
+    if board["type"] == "sce_lobby":
+        return sce_fetch_articles(board)
+    raise ValueError(board["type"])
+
+
+def board_new(board, seen):
+    """새 글(오래된 것 먼저), 미리보기/첨부까지 채워서 반환."""
+    if board["type"] == "skku_list":
+        new = skku_collect_new(board, seen)
+        for a in new:
+            skku_enrich(board, a)
+        return new
+    if board["type"] == "sce_lobby":
+        items = sce_fetch_articles(board)  # 이미 미리보기 포함
+        new = [a for a in items if a["no"] not in seen]
+        return sorted(new, key=lambda a: a["no"])
+    raise ValueError(board["type"])
+
+
+def board_enrich_one(board, article):
+    """동작확인(FORCE_LATEST)용: 최신 1건에 미리보기/첨부를 채운다."""
+    if board["type"] == "skku_list":
+        skku_enrich(board, article)
+    # sce_lobby 는 이미 채워져 있음
+    return article
+
+
+# ─────────────────── 상태파일 ───────────────────
+def load_seen(state_file):
+    if state_file.exists():
         try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            data = json.loads(state_file.read_text(encoding="utf-8"))
             return set(data.get("seen", []))
         except (json.JSONDecodeError, ValueError):
             return set()
     return set()
 
 
-def save_seen(seen):
+def save_seen(state_file, seen):
     trimmed = sorted(seen, reverse=True)[:500]
-    STATE_FILE.write_text(
+    state_file.write_text(
         json.dumps({"seen": trimmed}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
 
-def build_embed(article, detail):
-    cat = _cat_key(article["category"])
+# ─────────────────── Discord 전송 ───────────────────
+def build_embed(board, article):
+    cat = _cat_key(article.get("category", ""))
     color = CATEGORY_COLORS.get(cat, DEFAULT_COLOR)
     emoji = CATEGORY_EMOJI.get(cat, "🔔")
+    logo = board.get("logo")
 
     title = article["title"]
     if len(title) > 240:
         title = title[:237] + "..."
 
     embed = {
-        "author": {"name": f"{emoji} {article['category'] or '공지'}", "icon_url": LOGO_URL},
+        "author": {"name": f"{emoji} {article.get('category') or '공지'}", "icon_url": logo},
         "title": title,
         "url": article["url"],
         "color": color,
         "fields": [],
-        "footer": {"text": "성균관대학교 공지사항", "icon_url": LOGO_URL},
+        "footer": {"text": board["name"], "icon_url": logo},
     }
 
-    if detail.get("preview"):
-        embed["description"] = detail["preview"]
-
+    if article.get("preview"):
+        embed["description"] = article["preview"]
     if article.get("writer"):
         embed["fields"].append({"name": "✍️ 작성", "value": article["writer"], "inline": True})
     if article.get("date"):
         embed["fields"].append({"name": "📅 작성일", "value": article["date"], "inline": True})
 
-    atts = detail.get("attachments") or []
+    atts = article.get("attachments") or []
     if atts:
         shown = atts[:5]
         value = "\n".join(f"• {name}" for name in shown)
@@ -249,7 +351,6 @@ def build_embed(article, detail):
             value += f"\n… 외 {len(atts) - 5}개"
         embed["fields"].append({"name": f"📎 첨부파일 ({len(atts)})", "value": value, "inline": False})
 
-    # 날짜를 ISO timestamp 로 (YYYY-MM-DD 형태면)
     date = article.get("date", "")
     if len(date) == 10 and date[4] == "-":
         embed["timestamp"] = f"{date}T00:00:00.000Z"
@@ -257,63 +358,76 @@ def build_embed(article, detail):
     return embed
 
 
-def send_discord(webhook, article, detail, prefix="📢 **새 공지가 올라왔어요!**"):
-    payload = {"content": prefix, "embeds": [build_embed(article, detail)]}
+def send_discord(webhook, board, article, prefix="📢 **새 공지가 올라왔어요!**"):
+    payload = {"content": prefix, "embeds": [build_embed(board, article)]}
     r = requests.post(webhook, json=payload, timeout=20)
     r.raise_for_status()
 
 
-def main():
-    webhook = os.environ.get("DISCORD_WEBHOOK_URL")
-    force_latest = os.environ.get("FORCE_LATEST") == "1"
-
+# ─────────────────── 보드 처리 ───────────────────
+def process_board(board, force_latest):
+    webhook = os.environ.get(board["webhook_env"])
+    tag = f"[{board['key']}] {board['name']}"
     if not webhook:
-        print("ERROR: DISCORD_WEBHOOK_URL 환경변수가 없습니다.", file=sys.stderr)
-        sys.exit(1)
-
-    articles = fetch_articles()
-    if not articles:
-        print("게시글을 하나도 파싱하지 못했습니다. HTML 구조가 바뀌었을 수 있습니다.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"파싱된 게시글: {len(articles)}건")
-    print(f"최신 글: [{articles[0]['no']}] {articles[0]['title']}")
-
-    seen = load_seen()
-    first_run = len(seen) == 0
-
-    if first_run:
-        for a in articles:
-            seen.add(a["no"])
-        save_seen(seen)
-        print("최초 실행: 현재 목록을 기준선으로 저장했습니다. (알림 없음)")
-        if force_latest:
-            latest = articles[0]
-            send_discord(webhook, latest, fetch_detail(latest["no"]),
-                         prefix="✅ **동작 확인** — 현재 최신 글")
-            print("FORCE_LATEST: 최신 글 1건을 테스트 전송했습니다.")
+        print(f"{tag}: Webhook 미설정({board['webhook_env']}) → 건너뜀")
         return
 
-    new_articles = collect_new_articles(seen)
+    print(f"\n=== {tag} ===")
+    current = board_current(board)
+    if not current:
+        print("  게시글을 파싱하지 못했습니다. HTML 구조가 바뀌었을 수 있습니다.", file=sys.stderr)
+        return
 
+    print(f"  현재 노출 {len(current)}건, 최신: [{current[0]['no']}] {current[0]['title']}")
+
+    state_file = HERE / board["state_file"]
+    seen = load_seen(state_file)
+
+    if not seen:  # 최초 실행: 기준선만 저장, 알림 없음
+        save_seen(state_file, {a["no"] for a in current})
+        print("  최초 실행: 기준선 저장 완료 (알림 없음)")
+        if force_latest:
+            send_discord(webhook, board, board_enrich_one(board, current[0]),
+                         prefix="✅ **동작 확인** — 현재 최신 글")
+            print("  FORCE_LATEST: 최신 글 1건 테스트 전송")
+        return
+
+    new_articles = board_new(board, seen)
     if not new_articles:
-        print("새 글이 없습니다.")
+        print("  새 글 없음")
         if force_latest:
-            latest = articles[0]
-            send_discord(webhook, latest, fetch_detail(latest["no"]),
+            send_discord(webhook, board, board_enrich_one(board, current[0]),
                          prefix="✅ **동작 확인** — 현재 최신 글")
-            print("FORCE_LATEST: 최신 글 1건을 테스트 전송했습니다.")
+            print("  FORCE_LATEST: 최신 글 1건 테스트 전송")
         return
 
-    print(f"새 글 {len(new_articles)}건 전송 중...")
+    print(f"  새 글 {len(new_articles)}건 전송 중...")
     for a in new_articles:
-        detail = fetch_detail(a["no"])
-        send_discord(webhook, a, detail)
+        send_discord(webhook, board, a)
         seen.add(a["no"])
-        print(f"  전송: [{a['no']}] {a['title']}")
+        print(f"    전송: [{a['no']}] {a['title']}")
+    save_seen(state_file, seen)
+    print("  완료.")
 
-    save_seen(seen)
-    print("완료.")
+
+def main():
+    force_latest = os.environ.get("FORCE_LATEST") == "1"
+    configured = [b for b in BOARDS if os.environ.get(b["webhook_env"])]
+    if not configured:
+        print("ERROR: 설정된 Webhook 이 하나도 없습니다. "
+              "DISCORD_WEBHOOK_URL 등을 설정하세요.", file=sys.stderr)
+        sys.exit(1)
+
+    had_error = False
+    for board in BOARDS:
+        try:
+            process_board(board, force_latest)
+        except Exception as e:  # noqa: BLE001 - 한 보드 실패가 다른 보드를 막지 않게
+            had_error = True
+            print(f"[{board['key']}] 처리 중 오류: {e}", file=sys.stderr)
+
+    if had_error:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
