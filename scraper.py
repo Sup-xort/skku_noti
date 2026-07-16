@@ -21,8 +21,12 @@ import requests
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.skku.edu/skku/campus/skk_comm/notice01.do"
-LIST_URL = f"{BASE_URL}?mode=list&articleLimit=10&article.offset=0"
 STATE_FILE = Path(__file__).parent / "seen_articles.json"
+
+# 한 페이지 게시글 수, 그리고 새 글을 찾아 거슬러 올라갈 최대 페이지 수(안전 상한).
+# 새 글이 한 페이지에 하나도 없으면 그 지점에서 멈추므로, 보통은 1~2페이지만 읽는다.
+PAGE_SIZE = 10
+MAX_PAGES = 10
 
 LOGO_URL = "https://www.skku.edu/_res/skku/img/skku_s.png"
 
@@ -73,12 +77,13 @@ def _cat_key(category):
     return category.strip().strip("[]").strip()
 
 
-def fetch_articles():
-    """목록 페이지를 파싱해 게시글 리스트를 반환.
+def fetch_page(offset=0):
+    """목록의 한 페이지를 파싱해 게시글 리스트를 반환.
 
     반환: [{no, title, url, category, writer, date, pinned}], 최신(articleNo 큰 것)이 앞.
     """
-    resp = requests.get(LIST_URL, headers=HEADERS, timeout=20)
+    list_url = f"{BASE_URL}?mode=list&articleLimit={PAGE_SIZE}&article.offset={offset}"
+    resp = requests.get(list_url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
     resp.encoding = resp.apparent_encoding or "utf-8"
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -122,6 +127,36 @@ def fetch_articles():
 
     articles.sort(key=lambda a: a["no"], reverse=True)
     return articles
+
+
+def fetch_articles():
+    """목록 첫 페이지만 반환(최초 실행 기준선/동작확인용)."""
+    return fetch_page(0)
+
+
+def collect_new_articles(seen):
+    """이미 본 글이 나올 때까지 페이지를 넘겨가며 '새 글'을 모두 수집한다.
+
+    새 글이 한 페이지에 하나도 없으면 멈춘다(그 이후는 전부 본 글).
+    고정공지(pinned)가 여러 페이지에 반복돼도 articleNo 로 중복 제거된다.
+    반환: 새 글 리스트(articleNo 오름차순 = 오래된 것 먼저).
+    """
+    new_by_no = {}
+    for page in range(MAX_PAGES):
+        articles = fetch_page(page * PAGE_SIZE)
+        if not articles:
+            break
+        page_new = [a for a in articles if a["no"] not in seen and a["no"] not in new_by_no]
+        for a in page_new:
+            new_by_no[a["no"]] = a
+        # 이 페이지에서 새 글이 하나도 없으면 더 볼 필요 없음
+        if not page_new:
+            break
+    else:
+        print(f"경고: 최대 {MAX_PAGES}페이지까지 읽었지만 계속 새 글이 있었습니다. "
+              "일부 오래된 글을 놓쳤을 수 있습니다.", file=sys.stderr)
+
+    return sorted(new_by_no.values(), key=lambda a: a["no"])
 
 
 def fetch_detail(no):
@@ -259,8 +294,7 @@ def main():
             print("FORCE_LATEST: 최신 글 1건을 테스트 전송했습니다.")
         return
 
-    new_articles = [a for a in articles if a["no"] not in seen]
-    new_articles.sort(key=lambda a: a["no"])
+    new_articles = collect_new_articles(seen)
 
     if not new_articles:
         print("새 글이 없습니다.")
