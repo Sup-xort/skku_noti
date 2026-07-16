@@ -49,13 +49,12 @@ BOARDS = [
         "state_file": "seen_sce.json",
         "index_url": "https://sce.skku.edu/sce/index.do",
         "view_base": "https://sce.skku.edu/sce/notice.do",
-        # 표시 스타일: 미니멀 · 단일 테마색 · 칩(반도체) 이모지 + 학과 칩 로고(썸네일).
+        # 표시 스타일: 미니멀 · 단일 테마색. 로고/이모지 없이 깔끔하게.
         "style": "simple",
-        "logo": "https://raw.githubusercontent.com/Sup-xort/skku_noti/"
-                "claude/school-notice-discord-bot-adzhn5/SCE_logo.png",
+        "logo": None,
         "accent_color": 0x0EA5A6,   # 테크 틸(teal) — 대학 카드와 확실히 구분
-        "symbol": "🔬",
-        "new_prefix": "🔬 **[반도체융합공학과] 새 공지**",
+        "symbol": "",
+        "new_prefix": "**[반도체융합공학과] 새 공지**",
     },
 ]
 
@@ -374,18 +373,19 @@ def build_embed_simple(board, article):
 
     카테고리는 제목 앞 배지로, 날짜/첨부는 하단에 간결하게 녹인다.
     """
-    symbol = board.get("symbol", "🔔")
+    symbol = board.get("symbol", "")
     color = board.get("accent_color", DEFAULT_COLOR)
     cat = _cat_key(article.get("category", ""))
 
+    author_name = f"{symbol} {board['name']}".strip()
     title = _title(article)
     embed = {
-        "author": {"name": f"{symbol} {board['name']}"},
+        "author": {"name": author_name},
         "title": f"「{cat}」 {title}" if cat else title,
         "url": article["url"],
         "color": color,
     }
-    if board.get("logo"):  # 학과 칩 로고를 오른쪽 썸네일로
+    if board.get("logo"):  # 로고가 설정돼 있으면 오른쪽 썸네일로
         embed["thumbnail"] = {"url": board["logo"]}
 
     parts = []

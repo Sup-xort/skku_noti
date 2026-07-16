@@ -83,13 +83,14 @@ python scraper.py
 ### 게시판별 메시지 스타일
 각 게시판은 `BOARDS` 항목의 `style` 값으로 카드 모양을 고릅니다.
 - `"full"` (대학 공지) — 카테고리별 색상/이모지 + 로고 아이콘 + 작성/작성일/첨부 필드
-- `"simple"` (학과 공지) — 미니멀 카드: 단일 테마색(`accent_color`) + 칩 이모지(`symbol`),
-  카테고리는 제목 앞 배지(`「채용/모집」`), 날짜는 하단에 간결하게. 로고 이미지 없음.
+- `"simple"` (학과 공지) — 미니멀 카드: 단일 테마색(`accent_color`)만으로 정체성,
+  카테고리는 제목 앞 배지(`「채용/모집」`), 날짜는 하단에 간결하게. 로고/이모지 없음.
 
-관련 설정: `accent_color`(고정 색상), `symbol`(앞 이모지), `new_prefix`(알림 머리말), `logo`(아이콘 URL).
+관련 설정: `accent_color`(고정 색상), `symbol`(앞 이모지, 비우면 없음), `new_prefix`(알림 머리말), `logo`(썸네일 URL).
 
-> 학과 공식 심볼 이미지가 생기면, 그 PNG를 레포에 넣고(`assets/` 등) `raw.githubusercontent.com`
-> URL 을 sce 보드의 `logo` 에 넣으면 카드에 로고가 표시됩니다. (레포가 public 이어야 Discord 가 이미지를 가져옵니다.)
+> `logo` 에 이미지 URL(`raw.githubusercontent.com` 등)을 넣으면 카드 오른쪽에 썸네일로 표시됩니다.
+> `symbol` 에 이모지를 넣으면 머리 라인에 붙습니다. 둘 다 비우면 지금처럼 텍스트만 나옵니다.
+> (레포가 public 이어야 Discord 가 이미지를 가져옵니다.)
 
 ### 공통
 - `CATEGORY_COLORS` / `CATEGORY_EMOJI` — `full` 스타일의 카테고리별 색상·이모지
