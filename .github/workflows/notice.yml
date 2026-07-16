@@ -1,0 +1,53 @@
+name: SKKU Notice Watcher
+
+on:
+  schedule:
+    # 매시 정각(UTC). 한국시간 기준으로도 매시 정각에 실행됨.
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_latest:
+        description: '새 글이 없어도 최신 글 1건을 테스트 전송'
+        type: boolean
+        default: true
+
+# 상태 파일(seen_articles.json) 커밋을 위해 쓰기 권한 필요
+permissions:
+  contents: write
+
+# 동시 실행 방지 (겹치면 커밋 충돌 위험)
+concurrency:
+  group: notice-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # 수동 실행 시 버튼 옵션값 사용, 스케줄 실행 시엔 빈 값
+          FORCE_LATEST: ${{ github.event_name == 'workflow_dispatch' && inputs.force_latest && '1' || '' }}
+        run: python scraper.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_articles.json
+          if git diff --staged --quiet; then
+            echo "변경된 상태 없음."
+          else
+            git commit -m "chore: update seen_articles [skip ci]"
+            git push
+          fi
