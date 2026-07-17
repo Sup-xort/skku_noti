@@ -19,6 +19,7 @@ Webhook 이 설정되지 않은 보드는 조용히 건너뛴다.
 import html as html_lib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -115,8 +116,15 @@ def _truncate(text, limit=PREVIEW_LEN):
 
 
 # ─────────────────── skku_list (대학 공지) 파서 ───────────────────
+# 주의: 이 게시판의 articleNo(내부 DB id)는 게시 순서와 무관하다.
+# 실제 게시 순서는 목록에 표시되는 "No.XXXXX"(seq)가 결정한다(내림차순 = 최신 먼저).
+# 그래서 순서·최신 판정·새 글 감지는 모두 seq 를 기준으로 한다.
+# 고정공지("공지")는 seq 가 없으므로 articleNo 로 따로 중복 관리한다.
 def skku_fetch_page(board, offset=0):
-    """대학 공지 목록의 한 페이지를 파싱해 게시글 리스트(최신 먼저)를 반환."""
+    """대학 공지 목록의 한 페이지를 사이트 원본 순서(최신 먼저) 그대로 파싱해 반환.
+
+    각 항목에 seq(표시번호 No., 고정공지는 None)를 포함한다.
+    """
     base = board["base_url"]
     list_url = f"{base}?mode=list&articleLimit={PAGE_SIZE}&article.offset={offset}"
     resp = requests.get(list_url, headers=HEADERS, timeout=20)
@@ -145,12 +153,18 @@ def skku_fetch_page(board, offset=0):
         info = dl.select("dd.board-list-content-info li")
         first = info[0].get_text(strip=True) if len(info) > 0 else ""
         pinned = "공지" in first
+        # 비고정 글의 표시번호(No.25455 → 25455). 고정공지는 seq 없음(None).
+        seq = None
+        if not pinned:
+            m = re.search(r"\d+", first)
+            seq = int(m.group()) if m else None
         writer = info[1].get_text(strip=True) if len(info) > 1 else ""
         date = info[2].get_text(strip=True) if len(info) > 2 else ""
 
         articles.append(
             {
                 "no": int(no),
+                "seq": seq,
                 "title": html_lib.unescape(title),
                 "url": f"{base}?mode=view&articleNo={no}&article.offset=0&articleLimit=10",
                 "category": category,
@@ -160,27 +174,70 @@ def skku_fetch_page(board, offset=0):
             }
         )
 
-    articles.sort(key=lambda a: a["no"], reverse=True)
+    # 정렬하지 않는다 — 사이트 원본 순서(최신 먼저)를 그대로 유지.
     return articles
 
 
-def skku_collect_new(board, seen):
-    """이미 본 글이 나올 때까지 페이지를 넘겨가며 새 글을 모두 수집(오래된 것 먼저)."""
-    new_by_no = {}
+def skku_seed(board):
+    """최초 실행 기준선: 현재 최대 seq 와 현재 고정공지들을 저장(알림 없음)."""
+    arts = skku_fetch_page(board, 0)
+    seqs = [a["seq"] for a in arts if a.get("seq") is not None]
+    last_seq = max(seqs) if seqs else 0
+    pinned_seen = sorted(a["no"] for a in arts if a["pinned"])
+    return {"last_seq": last_seq, "pinned_seen": pinned_seen}
+
+
+def skku_latest(board):
+    """동작확인용: 현재 가장 최신(비고정 중 seq 최대) 글."""
+    arts = skku_fetch_page(board, 0)
+    non_pinned = [a for a in arts if not a["pinned"] and a.get("seq") is not None]
+    if non_pinned:
+        return max(non_pinned, key=lambda a: a["seq"])
+    return arts[0] if arts else None
+
+
+def skku_detect(board, state):
+    """seq 하이워터마크로 새 글을 감지. 반환: (오래된 것 먼저 정렬된 새 글, 갱신된 state).
+
+    - 비고정 글: seq > last_seq 이면 새 글. 페이지는 seq 내림차순이라, last_seq 이하를
+      만나면 그 이후는 모두 옛 글이므로 멈춘다. 한 페이지가 전부 새 글이면 다음 페이지도 확인.
+    - 고정공지: seq 가 없으므로 articleNo 가 pinned_seen 에 없으면 새 글로 간주.
+    """
+    last_seq = state.get("last_seq", 0)
+    pinned_seen = set(state.get("pinned_seen", []))
+
+    new_regular = []
+    new_pinned = []
+    max_seq = last_seq
+    reached_old = False
+
     for page in range(MAX_PAGES):
-        articles = skku_fetch_page(board, page * PAGE_SIZE)
-        if not articles:
+        arts = skku_fetch_page(board, page * PAGE_SIZE)
+        if not arts:
             break
-        page_new = [a for a in articles if a["no"] not in seen and a["no"] not in new_by_no]
-        for a in page_new:
-            new_by_no[a["no"]] = a
-        if not page_new:
+        progressed = False
+        for a in arts:
+            if a["pinned"] or a.get("seq") is None:
+                if a["no"] not in pinned_seen:
+                    new_pinned.append(a)
+                    pinned_seen.add(a["no"])
+                continue
+            if a["seq"] > last_seq:
+                new_regular.append(a)
+                max_seq = max(max_seq, a["seq"])
+                progressed = True
+            else:
+                reached_old = True
+        if reached_old or not progressed:
             break
     else:
-        print(f"경고[{board['key']}]: 최대 {MAX_PAGES}페이지를 읽었지만 계속 새 글이 있었습니다. "
+        print(f"경고[{board['key']}]: {MAX_PAGES}페이지까지 계속 새 글이 있었습니다. "
               "일부 오래된 글을 놓쳤을 수 있습니다.", file=sys.stderr)
 
-    return sorted(new_by_no.values(), key=lambda a: a["no"])
+    new_regular.sort(key=lambda a: a["seq"])   # 오래된 것 먼저
+    ordered = new_regular + new_pinned
+    new_state = {"last_seq": max_seq, "pinned_seen": sorted(pinned_seen)[-50:]}
+    return ordered, new_state
 
 
 def skku_enrich(board, article):
@@ -271,57 +328,86 @@ def sce_fetch_articles(board):
             }
         )
 
-    articles.sort(key=lambda a: a["no"], reverse=True)
+    # 로비는 이미 최신 먼저 순서 — 정렬하지 않고 원본 순서 유지.
     return articles
 
 
+def sce_seed(board):
+    """최초 실행 기준선: 현재 로비 글들을 본 것으로 저장(알림 없음)."""
+    arts = sce_fetch_articles(board)
+    return {"seen": [a["no"] for a in arts]}
+
+
+def sce_detect(board, state):
+    """로비에서 seen 에 없는 글을 새 글로. 반환: (오래된 것 먼저, 갱신된 state)."""
+    seen = set(state.get("seen", []))
+    arts = sce_fetch_articles(board)          # 최신 먼저
+    new = [a for a in arts if a["no"] not in seen]
+    new.reverse()                              # 오래된 것 먼저
+    for a in new:
+        seen.add(a["no"])
+    new_state = {"seen": sorted(seen)[-500:]}
+    return new, new_state
+
+
+def sce_latest(board):
+    arts = sce_fetch_articles(board)
+    return arts[0] if arts else None
+
+
 # ─────────────────── 보드 타입 디스패치 ───────────────────
-def board_current(board):
-    """현재 노출된 게시글 전체(최신 먼저). 최초 실행 기준선/동작확인용."""
+def board_is_first_run(board, state):
     if board["type"] == "skku_list":
-        return skku_fetch_page(board, 0)
+        return "last_seq" not in state
+    return not state.get("seen")
+
+
+def board_seed(board):
+    """최초 실행 기준선 state 를 만든다(알림 없음)."""
+    if board["type"] == "skku_list":
+        return skku_seed(board)
     if board["type"] == "sce_lobby":
-        return sce_fetch_articles(board)
+        return sce_seed(board)
     raise ValueError(board["type"])
 
 
-def board_new(board, seen):
-    """새 글(오래된 것 먼저), 미리보기/첨부까지 채워서 반환."""
+def board_detect(board, state):
+    """새 글(오래된 것 먼저)과 갱신된 state 를 반환. 미리보기/첨부까지 채운다."""
     if board["type"] == "skku_list":
-        new = skku_collect_new(board, seen)
+        new, new_state = skku_detect(board, state)
         for a in new:
             skku_enrich(board, a)
-        return new
+        return new, new_state
     if board["type"] == "sce_lobby":
-        items = sce_fetch_articles(board)  # 이미 미리보기 포함
-        new = [a for a in items if a["no"] not in seen]
-        return sorted(new, key=lambda a: a["no"])
+        return sce_detect(board, state)  # 이미 미리보기 포함
     raise ValueError(board["type"])
 
 
-def board_enrich_one(board, article):
-    """동작확인(FORCE_LATEST)용: 최신 1건에 미리보기/첨부를 채운다."""
+def board_latest(board):
+    """동작확인(FORCE_LATEST)용 최신 글 1건(미리보기/첨부 채워서)."""
     if board["type"] == "skku_list":
-        skku_enrich(board, article)
-    # sce_lobby 는 이미 채워져 있음
-    return article
+        a = skku_latest(board)
+        if a:
+            skku_enrich(board, a)
+        return a
+    if board["type"] == "sce_lobby":
+        return sce_latest(board)
+    raise ValueError(board["type"])
 
 
 # ─────────────────── 상태파일 ───────────────────
-def load_seen(state_file):
+def load_state(state_file):
     if state_file.exists():
         try:
-            data = json.loads(state_file.read_text(encoding="utf-8"))
-            return set(data.get("seen", []))
+            return json.loads(state_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, ValueError):
-            return set()
-    return set()
+            return {}
+    return {}
 
 
-def save_seen(state_file, seen):
-    trimmed = sorted(seen, reverse=True)[:500]
+def save_state(state_file, state):
     state_file.write_text(
-        json.dumps({"seen": trimmed}, ensure_ascii=False, indent=2),
+        json.dumps(state, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -437,40 +523,35 @@ def process_board(board, force_latest):
         return
 
     print(f"\n=== {tag} ===")
-    current = board_current(board)
-    if not current:
-        print("  게시글을 파싱하지 못했습니다. HTML 구조가 바뀌었을 수 있습니다.", file=sys.stderr)
-        return
-
-    print(f"  현재 노출 {len(current)}건, 최신: [{current[0]['no']}] {current[0]['title']}")
-
     state_file = HERE / board["state_file"]
-    seen = load_seen(state_file)
+    state = load_state(state_file)
 
-    if not seen:  # 최초 실행: 기준선만 저장, 알림 없음
-        save_seen(state_file, {a["no"] for a in current})
+    def send_test_latest():
+        latest = board_latest(board)
+        if latest:
+            send_discord(webhook, board, latest, prefix="✅ **동작 확인** — 현재 최신 글")
+            print(f"  FORCE_LATEST: 최신 글 1건 테스트 전송 → {latest['title']}")
+
+    if board_is_first_run(board, state):  # 최초 실행: 기준선만 저장, 알림 없음
+        save_state(state_file, board_seed(board))
         print("  최초 실행: 기준선 저장 완료 (알림 없음)")
         if force_latest:
-            send_discord(webhook, board, board_enrich_one(board, current[0]),
-                         prefix="✅ **동작 확인** — 현재 최신 글")
-            print("  FORCE_LATEST: 최신 글 1건 테스트 전송")
+            send_test_latest()
         return
 
-    new_articles = board_new(board, seen)
+    new_articles, new_state = board_detect(board, state)
     if not new_articles:
         print("  새 글 없음")
+        save_state(state_file, new_state)
         if force_latest:
-            send_discord(webhook, board, board_enrich_one(board, current[0]),
-                         prefix="✅ **동작 확인** — 현재 최신 글")
-            print("  FORCE_LATEST: 최신 글 1건 테스트 전송")
+            send_test_latest()
         return
 
     print(f"  새 글 {len(new_articles)}건 전송 중...")
     for a in new_articles:
         send_discord(webhook, board, a)
-        seen.add(a["no"])
-        print(f"    전송: [{a['no']}] {a['title']}")
-    save_seen(state_file, seen)
+        print(f"    전송: [{a.get('seq') or a['no']}] {a['title']}")
+    save_state(state_file, new_state)
     print("  완료.")
 
 
