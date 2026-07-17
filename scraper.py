@@ -19,7 +19,6 @@ Webhook 이 설정되지 않은 보드는 조용히 건너뛴다.
 import html as html_lib
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -119,15 +118,11 @@ def _truncate(text, limit=PREVIEW_LEN):
 
 
 # ─────────────────── skku_list (대학 공지) 파서 ───────────────────
-# 주의: 이 게시판의 articleNo(내부 DB id)는 게시 순서와 무관하다.
-# 실제 게시 순서는 목록에 표시되는 "No.XXXXX"(seq)가 결정한다(내림차순 = 최신 먼저).
-# 그래서 순서·최신 판정·새 글 감지는 모두 seq 를 기준으로 한다.
-# 고정공지("공지")는 seq 가 없으므로 articleNo 로 따로 중복 관리한다.
+# 식별(중복 판정)은 URL 의 articleNo(생성 시 부여되는 고정 DB id, 재사용·이동 없음)로 한다.
+# 목록에 보이는 "No.XXXXX"는 현재 위치로 계산되는 번호라 글이 삭제되면 밀리므로 식별에 쓰지 않는다.
+# 순서는 사이트가 준 목록 순서(최신 먼저)를 그대로 신뢰한다.
 def skku_fetch_page(board, offset=0):
-    """대학 공지 목록의 한 페이지를 사이트 원본 순서(최신 먼저) 그대로 파싱해 반환.
-
-    각 항목에 seq(표시번호 No., 고정공지는 None)를 포함한다.
-    """
+    """대학 공지 목록의 한 페이지를 사이트 원본 순서(최신 먼저) 그대로 파싱해 반환."""
     base = board["base_url"]
     list_url = f"{base}?mode=list&articleLimit={PAGE_SIZE}&article.offset={offset}"
     resp = requests.get(list_url, headers=HEADERS, timeout=20)
@@ -156,18 +151,12 @@ def skku_fetch_page(board, offset=0):
         info = dl.select("dd.board-list-content-info li")
         first = info[0].get_text(strip=True) if len(info) > 0 else ""
         pinned = "공지" in first
-        # 비고정 글의 표시번호(No.25455 → 25455). 고정공지는 seq 없음(None).
-        seq = None
-        if not pinned:
-            m = re.search(r"\d+", first)
-            seq = int(m.group()) if m else None
         writer = info[1].get_text(strip=True) if len(info) > 1 else ""
         date = info[2].get_text(strip=True) if len(info) > 2 else ""
 
         articles.append(
             {
                 "no": int(no),
-                "seq": seq,
                 "title": html_lib.unescape(title),
                 "url": f"{base}?mode=view&articleNo={no}&article.offset=0&articleLimit=10",
                 "category": category,
@@ -182,82 +171,81 @@ def skku_fetch_page(board, offset=0):
 
 
 def skku_seed(board):
-    """최초 실행 기준선: 현재 최대 seq 를 저장(알림 없음)."""
-    arts = skku_fetch_page(board, 0)
-    seqs = [a["seq"] for a in arts if a.get("seq") is not None]
-    return {"last_seq": max(seqs) if seqs else 0}
+    """최초 실행 기준선: 현재 노출되는 글들의 articleNo 를 모두 저장(알림 없음).
+
+    깊은 페이지까지 훑어 기준선에 포함해야, 이후 새 글이 옛 글을 아래로 밀어내도
+    그 옛 글을 새 글로 오인하지 않는다.
+    """
+    seen, new_state = skku_detect(board, {"seen": []}, seed_mode=True)
+    return new_state
 
 
 def skku_latest(board):
-    """동작확인용: 현재 가장 최신(비고정 중 seq 최대) 글."""
+    """동작확인용: 현재 목록 맨 위(비고정) 글."""
     arts = skku_fetch_page(board, 0)
-    non_pinned = [a for a in arts if not a["pinned"] and a.get("seq") is not None]
-    if non_pinned:
-        return max(non_pinned, key=lambda a: a["seq"])
+    for a in arts:
+        if not (a["pinned"] and board.get("ignore_pinned", False)):
+            return a
     return arts[0] if arts else None
 
 
-def skku_detect(board, state):
-    """seq 하이워터마크로 새 글을 감지. 반환: (오래된 것 먼저 정렬된 새 글, 갱신된 state).
+def skku_detect(board, state, seed_mode=False):
+    """articleNo(고정 DB id) 기준으로 새 글을 감지. 반환: (오래된 것 먼저, 갱신된 state).
 
-    seq > last_seq 이면 새 글. 페이지는 seq 내림차순이라, last_seq 이하를 만나면
-    그 이후는 모두 옛 글이므로 멈춘다. 한 페이지가 전부 새 글이면 다음 페이지도 확인.
+    - seen 에 없는 articleNo 가 새 글. articleNo 는 삭제·번호밀림·재사용에 영향받지 않는다.
+    - 최신 먼저 순서로 훑다가, 새 글이 하나도 없는 페이지를 만나면 그 아래는 모두 본 글이므로 멈춘다.
+    - seed_mode=True(최초 기준선 만들기)면 알림 목록을 만들지 않고 seen 만 채운다.
 
-    고정공지("공지", seq 없음)는 ignore_pinned 이면 무시한다.
-
-    안전장치:
-      - MAX_PAGES: 페이지를 무한정 넘기지 않는다.
-      - 같은 페이지 반복 감지: offset 이 무시돼 동일 페이지가 반복되면 중단.
-      - 실행 내 중복 제거: 같은 글을 두 번 처리하지 않는다.
-      - MAX_NOTIFY: 상태 손상 등으로 새 글이 폭증해도 최신 N건만 전송.
+    안전장치: MAX_PAGES / 같은 페이지 반복(offset 무시) 감지 / MAX_NOTIFY.
     """
-    last_seq = state.get("last_seq", 0)
+    seen_list = state.get("seen", [])
+    seen = set(seen_list)
     ignore_pinned = board.get("ignore_pinned", False)
 
-    new_regular = []
-    seen_this_run = set()   # 실행 내 중복 방지(같은 글이 여러 페이지에 반복돼도 1회만)
-    max_seq = last_seq
+    collected = []            # 새 글(최신 먼저)
+    collected_ids = set()
     prev_ids = None
-    reached_old = False
-
     for page in range(MAX_PAGES):
         arts = skku_fetch_page(board, page * PAGE_SIZE)
         if not arts:
             break
         ids = tuple(a["no"] for a in arts)
-        if ids == prev_ids:  # offset 이 안 먹혀 같은 페이지가 반복됨 → 폭주 방지
+        if ids == prev_ids:   # offset 이 안 먹혀 같은 페이지가 반복됨 → 폭주 방지
             print(f"경고[{board['key']}]: 페이지 {page} 가 이전과 동일 → 중단", file=sys.stderr)
             break
         prev_ids = ids
 
-        progressed = False
+        page_new = []
         for a in arts:
-            if a["no"] in seen_this_run:
+            if a["pinned"] and ignore_pinned:
                 continue
-            seen_this_run.add(a["no"])
-            if a["pinned"] or a.get("seq") is None:
-                if ignore_pinned:
-                    continue
-                # (고정공지도 알림받고 싶으면 여기서 처리 — 현재 보드는 무시)
+            if a["no"] in seen or a["no"] in collected_ids:
                 continue
-            if a["seq"] > last_seq:
-                new_regular.append(a)
-                max_seq = max(max_seq, a["seq"])
-                progressed = True
-            else:
-                reached_old = True
-        if reached_old or not progressed:
+            collected_ids.add(a["no"])
+            page_new.append(a)
+        collected.extend(page_new)
+        if seed_mode:
+            continue          # 기준선 만들 땐 멈추지 않고 깊은 페이지까지 훑는다
+        if not page_new:      # 새 글이 없는 페이지 → 그 아래는 모두 본 글
             break
     else:
-        print(f"경고[{board['key']}]: {MAX_PAGES}페이지까지 계속 새 글이 있었습니다. "
-              "일부 오래된 글을 놓쳤을 수 있습니다.", file=sys.stderr)
+        if not seed_mode:
+            print(f"경고[{board['key']}]: {MAX_PAGES}페이지까지 계속 새 글이 있었습니다. "
+                  "일부 오래된 글을 놓쳤을 수 있습니다.", file=sys.stderr)
 
-    new_regular.sort(key=lambda a: a["seq"])   # 오래된 것 먼저
-    if len(new_regular) > MAX_NOTIFY:
-        print(f"경고[{board['key']}]: 새 글 {len(new_regular)}건 → 최신 {MAX_NOTIFY}건만 전송",
+    # seen 갱신: 이번에 본 글(최신 먼저)을 앞에 붙이고 최근 500개만 유지.
+    merged = list(dict.fromkeys([a["no"] for a in collected] + seen_list))[:500]
+    new_state = {"seen": merged}
+
+    if seed_mode:
+        return [], new_state
+
+    new = list(reversed(collected))   # 오래된 것 먼저
+    if len(new) > MAX_NOTIFY:
+        print(f"경고[{board['key']}]: 새 글 {len(new)}건 → 최신 {MAX_NOTIFY}건만 전송",
               file=sys.stderr)
-        new_regular = new_regular[-MAX_NOTIFY:]
-    return new_regular, {"last_seq": max_seq}
+        new = new[-MAX_NOTIFY:]
+    return new, new_state
 
 
 def skku_enrich(board, article):
@@ -381,8 +369,6 @@ def sce_latest(board):
 
 # ─────────────────── 보드 타입 디스패치 ───────────────────
 def board_is_first_run(board, state):
-    if board["type"] == "skku_list":
-        return "last_seq" not in state
     return not state.get("seen")
 
 
