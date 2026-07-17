@@ -37,6 +37,8 @@ BOARDS = [
         "webhook_env": "DISCORD_WEBHOOK_URL",
         "state_file": "seen_articles.json",
         "base_url": "https://www.skku.edu/skku/campus/skk_comm/notice01.do",
+        # 고정공지("공지")는 교수임용 등 위주라 알림에서 제외한다.
+        "ignore_pinned": True,
         # 표시 스타일: 카테고리별 색상/이모지 + 로고 아이콘 + 상세 필드
         "style": "full",
         "logo": "https://www.skku.edu/_res/skku/img/skku_s.png",
@@ -64,6 +66,7 @@ BOARDS = [
 # ─────────────────────────── 공통 설정 ───────────────────────────
 PAGE_SIZE = 10   # skku_list: 한 페이지 게시글 수
 MAX_PAGES = 10   # skku_list: 새 글을 찾아 거슬러 올라갈 최대 페이지(안전 상한)
+MAX_NOTIFY = 20  # 한 실행에서 보낼 최대 알림 수(상태 손상 등 폭주 방지)
 PREVIEW_LEN = 180  # 본문 미리보기 최대 길이(글자)
 
 HEADERS = {
@@ -179,12 +182,10 @@ def skku_fetch_page(board, offset=0):
 
 
 def skku_seed(board):
-    """최초 실행 기준선: 현재 최대 seq 와 현재 고정공지들을 저장(알림 없음)."""
+    """최초 실행 기준선: 현재 최대 seq 를 저장(알림 없음)."""
     arts = skku_fetch_page(board, 0)
     seqs = [a["seq"] for a in arts if a.get("seq") is not None]
-    last_seq = max(seqs) if seqs else 0
-    pinned_seen = sorted(a["no"] for a in arts if a["pinned"])
-    return {"last_seq": last_seq, "pinned_seen": pinned_seen}
+    return {"last_seq": max(seqs) if seqs else 0}
 
 
 def skku_latest(board):
@@ -199,28 +200,45 @@ def skku_latest(board):
 def skku_detect(board, state):
     """seq 하이워터마크로 새 글을 감지. 반환: (오래된 것 먼저 정렬된 새 글, 갱신된 state).
 
-    - 비고정 글: seq > last_seq 이면 새 글. 페이지는 seq 내림차순이라, last_seq 이하를
-      만나면 그 이후는 모두 옛 글이므로 멈춘다. 한 페이지가 전부 새 글이면 다음 페이지도 확인.
-    - 고정공지: seq 가 없으므로 articleNo 가 pinned_seen 에 없으면 새 글로 간주.
+    seq > last_seq 이면 새 글. 페이지는 seq 내림차순이라, last_seq 이하를 만나면
+    그 이후는 모두 옛 글이므로 멈춘다. 한 페이지가 전부 새 글이면 다음 페이지도 확인.
+
+    고정공지("공지", seq 없음)는 ignore_pinned 이면 무시한다.
+
+    안전장치:
+      - MAX_PAGES: 페이지를 무한정 넘기지 않는다.
+      - 같은 페이지 반복 감지: offset 이 무시돼 동일 페이지가 반복되면 중단.
+      - 실행 내 중복 제거: 같은 글을 두 번 처리하지 않는다.
+      - MAX_NOTIFY: 상태 손상 등으로 새 글이 폭증해도 최신 N건만 전송.
     """
     last_seq = state.get("last_seq", 0)
-    pinned_seen = set(state.get("pinned_seen", []))
+    ignore_pinned = board.get("ignore_pinned", False)
 
     new_regular = []
-    new_pinned = []
+    seen_this_run = set()   # 실행 내 중복 방지(같은 글이 여러 페이지에 반복돼도 1회만)
     max_seq = last_seq
+    prev_ids = None
     reached_old = False
 
     for page in range(MAX_PAGES):
         arts = skku_fetch_page(board, page * PAGE_SIZE)
         if not arts:
             break
+        ids = tuple(a["no"] for a in arts)
+        if ids == prev_ids:  # offset 이 안 먹혀 같은 페이지가 반복됨 → 폭주 방지
+            print(f"경고[{board['key']}]: 페이지 {page} 가 이전과 동일 → 중단", file=sys.stderr)
+            break
+        prev_ids = ids
+
         progressed = False
         for a in arts:
+            if a["no"] in seen_this_run:
+                continue
+            seen_this_run.add(a["no"])
             if a["pinned"] or a.get("seq") is None:
-                if a["no"] not in pinned_seen:
-                    new_pinned.append(a)
-                    pinned_seen.add(a["no"])
+                if ignore_pinned:
+                    continue
+                # (고정공지도 알림받고 싶으면 여기서 처리 — 현재 보드는 무시)
                 continue
             if a["seq"] > last_seq:
                 new_regular.append(a)
@@ -235,9 +253,11 @@ def skku_detect(board, state):
               "일부 오래된 글을 놓쳤을 수 있습니다.", file=sys.stderr)
 
     new_regular.sort(key=lambda a: a["seq"])   # 오래된 것 먼저
-    ordered = new_regular + new_pinned
-    new_state = {"last_seq": max_seq, "pinned_seen": sorted(pinned_seen)[-50:]}
-    return ordered, new_state
+    if len(new_regular) > MAX_NOTIFY:
+        print(f"경고[{board['key']}]: 새 글 {len(new_regular)}건 → 최신 {MAX_NOTIFY}건만 전송",
+              file=sys.stderr)
+        new_regular = new_regular[-MAX_NOTIFY:]
+    return new_regular, {"last_seq": max_seq}
 
 
 def skku_enrich(board, article):
@@ -347,6 +367,10 @@ def sce_detect(board, state):
     for a in new:
         seen.add(a["no"])
     new_state = {"seen": sorted(seen)[-500:]}
+    if len(new) > MAX_NOTIFY:                   # 폭주 방지(로비는 최대 4건이라 사실상 무해)
+        print(f"경고[{board['key']}]: 새 글 {len(new)}건 → 최신 {MAX_NOTIFY}건만 전송",
+              file=sys.stderr)
+        new = new[-MAX_NOTIFY:]
     return new, new_state
 
 
