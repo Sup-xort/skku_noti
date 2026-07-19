@@ -42,6 +42,7 @@ jobs:
         run: python scraper.py
 
       - name: Commit updated state
+        if: always()   # 한 보드가 실패해도, 성공한 보드의 상태는 반드시 저장(중복 알림 방지)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

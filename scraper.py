@@ -101,6 +101,26 @@ CATEGORY_EMOJI = {
 }
 
 
+def http_get(url, timeout=20, retries=2, backoff=3):
+    """GET 요청 + 일시적 오류(타임아웃/연결 실패) 시 짧은 재시도.
+
+    학교 서버가 잠깐 불안정할 때 한 번 삐끗했다고 실패로 끝나지 않게 한다.
+    마지막 시도까지 실패하면 예외를 그대로 올린다(호출부에서 처리).
+    """
+    import time
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as e:
+            last = e
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))  # 3s, 6s
+    raise last
+
+
 def _clean(text):
     return " ".join(text.split())
 
@@ -125,8 +145,7 @@ def skku_fetch_page(board, offset=0):
     """대학 공지 목록의 한 페이지를 사이트 원본 순서(최신 먼저) 그대로 파싱해 반환."""
     base = board["base_url"]
     list_url = f"{base}?mode=list&articleLimit={PAGE_SIZE}&article.offset={offset}"
-    resp = requests.get(list_url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
+    resp = http_get(list_url)
     resp.encoding = resp.apparent_encoding or "utf-8"
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -251,8 +270,7 @@ def skku_detect(board, state, seed_mode=False):
 def skku_enrich(board, article):
     """상세페이지에서 본문 미리보기/첨부파일을 채운다(실패해도 무해)."""
     try:
-        resp = requests.get(article["url"], headers=HEADERS, timeout=20)
-        resp.raise_for_status()
+        resp = http_get(article["url"])
         resp.encoding = resp.apparent_encoding or "utf-8"
         soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -277,8 +295,7 @@ def skku_enrich(board, article):
 def sce_fetch_articles(board):
     """학과 메인 로비의 최신 공지(보통 4건)를 파싱. 본문 전문이 로비에 포함돼 있어
     별도 상세 조회 없이 미리보기까지 채운다. (상세페이지는 로그인 벽)"""
-    resp = requests.get(board["index_url"], headers=HEADERS, timeout=20)
-    resp.raise_for_status()
+    resp = http_get(board["index_url"])
     resp.encoding = resp.apparent_encoding or "utf-8"
     soup = BeautifulSoup(resp.text, "html.parser")
 
